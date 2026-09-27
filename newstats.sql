@@ -84,3 +84,51 @@ WHERE season = '2024-25'
   AND age >= 32
 ORDER BY fantasy_value DESC
 LIMIT 25;
+
+
+
+def sync_current_rosters(self, client):
+    """
+    Full refresh of current_rosters — truncate and refill.
+    Wrapped in a single transaction so a failure leaves the old data intact.
+    """
+    teams = self.get_team_abbreviations()
+    current_season = self.fetch_one("""
+        SELECT id FROM seasons
+        ORDER BY start_date DESC
+        LIMIT 1
+    """)
+
+    all_rows = []
+
+    for abbrev in teams:
+        try:
+            roster = client.get_roster(abbrev, "current")
+            team = self.fetch_one("SELECT id FROM teams WHERE abbreviation = %s", (abbrev,))
+
+            for player in roster:
+                all_rows.append((
+                    player["id"],
+                    team["id"],
+                    player.get("sweaterNumber"),
+                ))
+        except Exception as e:
+            log.error(f"Roster fetch failed for {abbrev}: {e}")
+            raise  # bail out entirely — don't commit a partial refresh
+
+    try:
+        with self.conn.cursor() as cur:
+            cur.execute("TRUNCATE current_rosters")
+
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO current_rosters (player_id, team_id, jersey_number)
+                VALUES %s
+            """, all_rows)
+
+        self.conn.commit()
+        log.info(f"Current rosters refreshed — {len(all_rows)} players")
+
+    except Exception as e:
+        self.conn.rollback()
+        log.error(f"Roster refresh failed, rolled back: {e}")
+        raise
